@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "work_dir": "/var/lib/rw-backup-verify",
+  "pg_version": "17",
+  "settle_seconds": 25,
+  "runs_keep": 2,
+  "notify_on_success": true,
+  "verify": {
+    "interval_hours": 12
+  },
+  "checks": {
+    "timezone_skew_hours": 14,
+    "stability_seconds": 180,
+    "preflight_isolation": true,
+    "panel": {
+      "user_rows": true,
+      "event_freshness": true,
+      "stack": true,
+      "isolation": true,
+      "backend_ports": true
+    },
+    "bot": {
+      "bot_users": true,
+      "bot_payments": true,
+      "event_freshness": true,
+      "stack": true,
+      "isolation": true,
+      "backend_ports": true,
+      "tables": {
+        "users": [
+          "users",
+          "subscriptions",
+          "tariffs",
+          "app_settings",
+          "cabinet_email_verification_codes",
+          "cabinet_site_visits"
+        ],
+        "payments": [
+          "payments",
+          "payment_intents",
+          "payment_webhook_events",
+          "recurring_yookassa",
+          "recurring_robokassa"
+        ]
+      }
+    }
+  },
+  "telegram": {
+    "token": "",
+    "chat_id": "",
+    "thread_id": ""
+  },
+  "storages": []
+}

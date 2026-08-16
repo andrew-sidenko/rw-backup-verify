@@ -1,0 +1,20 @@
+[Unit]
+Description=rw-backup-verify worker (queue drain)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=RBV_CONFIG=/etc/rw-backup-verify/config.json
+Environment=RBV_INSTALL_DIR=/opt/rw-backup-verify
+ExecStart=/opt/rw-backup-verify/bin/rw-backup-verify tick
+# restore крупного дампа + stability-окно легко занимают десятки минут;
+# infinity допустим для systemd-таймера, но ручной/первый прогон контролируйте
+TimeoutStartSec=infinity
+# watchdog на случай зависания: таймер не запустит второй процесс благодаря
+# глобальному локу, но ExecStop поможет при необходимости
+ExecStop=-/usr/bin/pkill -f 'rw-backup-verify run'
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

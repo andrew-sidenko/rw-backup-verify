@@ -1,0 +1,606 @@
+#!/usr/bin/env bash
+# Главный CLI: rw-backup-verify <команда> ...
+set -euo pipefail
+# Через /usr/local/bin симлинк dirname(BASH_SOURCE)=/usr/local/bin → нужен realpath.
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "$_self")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+COMMON="${ROOT}/lib/common.sh"
+# Запасной путь на случай копирования бинаря без дерева (install.sh ставит в /opt).
+if [[ ! -f "$COMMON" ]]; then
+  COMMON="${RBV_INSTALL_DIR:-/opt/rw-backup-verify}/lib/common.sh"
+fi
+if [[ ! -f "$COMMON" ]]; then
+  echo "[ERR] Не найден common.sh (ожидали ${ROOT}/lib/common.sh). Переустановите: sudo ./install.sh" >&2
+  exit 1
+fi
+# shellcheck source=../lib/common.sh
+source "$COMMON"
+
+usage() {
+  cat <<'EOF'
+rw-backup-verify — автономная проверка логических бэкапов в S3
+
+  storage list|show|add|remove
+  telegram|tel|tg set|show
+  schedule show|set --times HH:MM,HH:MM | --interval-hours N
+
+  discover <storage-id> [--all]     # deep; по умолчанию только untested
+  run [--due]                       # все хранилища: discover untested → очередь → work
+  run --storage ID                  # только одно хранилище (с пошаговым логом)
+                                    #   --wait N: подождать N сек, если прогон уже идёт
+  queue status|clear|work
+  tested list <id> | clear <id> [--key KEY]
+  runs prune [--keep N]             # удалить старые runs/ (архивы → cache, default keep=2)
+  cache list | prune | clear        # prune = только последний архив на экземпляр
+  disk                              # что занимает место + подсказки
+  reclaim [--docker]                # runs keep=0 + cache latest + контейнеры/volumes
+                                    #   --docker: volume/container prune (ОБРАЗЫ не трогаем)
+                                    #   во время прогона откажется (--force = только чужое)
+  tick                              # systemd: если глобально due → run --due
+
+Все длительные/разрушающие команды (run, tick, queue work, reclaim, runs prune)
+держат один глобальный лок: параллельный прогон невозможен. Контейнеры и
+runs/<id> живого прогона не удаляются даже принудительной уборкой.
+
+Логи: work_dir/logs/run_*.log и work_dir/runs/<id>/
+Кэш (только latest, как в S3, без доп. шифрования): work_dir/cache/archives/
+  — при каждом run/tick старые скачанные удаляются;
+  — остаётся последняя копия на экземпляр для ручного прогона без S3.
+После теста: контейнеры/volumes удаляются; docker-образы сохраняются
+(при смене тега в compose — pull новых).
+PG verify: контейнер rbv_pg_* БЕЗ mount на хост (PGDATA в /var/lib/docker).
+Глубокий обход: любые вложенные папки; в каждой — экземпляры panel/bot
+(по семейству имён). Тестируется только latest каждого экземпляра,
+если этот архив ещё не был в tested/.
+EOF
+}
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] || { usage; exit 1; }
+shift || true
+
+case "$cmd" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+if [[ ! -f "$RBV_CONFIG" ]]; then
+  if [[ "$cmd" == "init" ]]; then
+    mkdir -p "$(dirname "$RBV_CONFIG")"
+    cp "${ROOT}/config/config.example.json" "$RBV_CONFIG"
+    chmod 600 "$RBV_CONFIG"
+    msg OK "Создан $RBV_CONFIG"
+    exit 0
+  fi
+  msg ERR "Нет $RBV_CONFIG — сначала: sudo rw-backup-verify init (или install.sh)"
+  exit 1
+fi
+
+rbv_load_config
+
+case "$cmd" in
+  init) msg INFO "Конфиг уже есть: $RBV_CONFIG" ;;
+
+  storage)
+    sub="${1:-list}"; shift || true
+    case "$sub" in
+      list)
+        jq -r '.storages[] | "\(.id)\tbucket=\(.bucket)\tprefix=\(.prefix // "")\thint=\(.backup_hint // "")"' \
+          "$RBV_CONFIG"
+        ;;
+      show)
+        id="${1:?id}"
+        rbv_storage_json "$id" | jq .
+        ;;
+      remove)
+        id="${1:?id}"
+        jq --arg id "$id" 'del(.storages[] | select(.id==$id))' "$RBV_CONFIG" | rbv_save_config
+        msg OK "Удалено: $id"
+        ;;
+      add)
+        ID=""; EP=""; BUCKET=""; AK=""; SK=""; REGION="us-east-1"
+        PREFIX=""; HINT=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --id) ID="$2"; shift 2 ;;
+            --endpoint) EP="$2"; shift 2 ;;
+            --bucket) BUCKET="$2"; shift 2 ;;
+            --access-key) AK="$2"; shift 2 ;;
+            --secret-key) SK="$2"; shift 2 ;;
+            --region) REGION="$2"; shift 2 ;;
+            --prefix) PREFIX="$2"; shift 2 ;;
+            --backup-hint) HINT="$2"; shift 2 ;;
+            --times|--interval-hours|--categories)
+              msg WARN "$1 устарел: расписание теперь глобальное (schedule set); категории — авто deep-scan"
+              shift 2 ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        [[ -n "$ID" && -n "$BUCKET" && -n "$AK" && -n "$SK" ]] \
+          || { msg ERR "--id --bucket --access-key --secret-key обязательны"; exit 1; }
+        entry="$(jq -nc \
+          --arg id "$ID" --arg ep "$EP" --arg b "$BUCKET" \
+          --arg ak "$AK" --arg sk "$SK" --arg r "$REGION" --arg p "$PREFIX" \
+          --arg hint "$HINT" \
+          '{id:$id, endpoint:$ep, bucket:$b, access_key:$ak, secret_key:$sk,
+            region:$r, prefix:$p, backup_hint:$hint, telegram:{}}')"
+        jq --argjson e "$entry" '
+          .storages = ([.storages[] | select(.id != $e.id)] + [$e])
+        ' "$RBV_CONFIG" | rbv_save_config
+        msg OK "Хранилище ${ID} сохранено"
+        ;;
+      *) msg ERR "storage: list|show|add|remove"; exit 1 ;;
+    esac
+    ;;
+
+  schedule)
+    sub="${1:-show}"; shift || true
+    case "$sub" in
+      show)
+        jq '.verify // {interval_hours:12}' "$RBV_CONFIG"
+        ;;
+      set)
+        TIMES=""; INTERVAL=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --times) TIMES="$2"; shift 2 ;;
+            --interval-hours) INTERVAL="$2"; shift 2 ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        if [[ -n "$INTERVAL" ]]; then
+          [[ "$INTERVAL" =~ ^[1-9][0-9]*$ ]] \
+            || { msg ERR "--interval-hours: целое число > 0"; exit 1; }
+          jq --argjson h "$INTERVAL" '.verify={interval_hours:$h}' "$RBV_CONFIG" | rbv_save_config
+        elif [[ -n "$TIMES" ]]; then
+          IFS=',' read -ra _times <<<"$TIMES"
+          ((${#_times[@]} > 0)) || { msg ERR "--times: пусто"; exit 1; }
+          for t in "${_times[@]}"; do
+            [[ "$t" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
+              || { msg ERR "--times: ожидается HH:MM (00–23:59), плохое значение: ${t}"; exit 1; }
+          done
+          jq --arg s "$TIMES" '.verify={times:($s|split(","))}' "$RBV_CONFIG" | rbv_save_config
+        else
+          msg ERR "нужен --times или --interval-hours"; exit 1
+        fi
+        msg OK "Глобальное расписание сохранено"
+        jq '.verify' "$RBV_CONFIG"
+        ;;
+      *) msg ERR "schedule: show|set"; exit 1 ;;
+    esac
+    ;;
+
+  telegram|tel|tg)
+    sub="${1:-show}"; shift || true
+    case "$sub" in
+      show) jq '.telegram' "$RBV_CONFIG" ;;
+      set)
+        TOK=""; CHAT=""; THR=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --token) TOK="$2"; shift 2 ;;
+            --chat-id) CHAT="$2"; shift 2 ;;
+            --thread-id) THR="$2"; shift 2 ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        [[ -n "$TOK" && -n "$CHAT" ]] || { msg ERR "--token и --chat-id"; exit 1; }
+        jq --arg t "$TOK" --arg c "$CHAT" --arg h "$THR" \
+          '.telegram.token=$t | .telegram.chat_id=$c | .telegram.thread_id=$h' \
+          "$RBV_CONFIG" | rbv_save_config
+        msg OK "Telegram сохранён"
+        ;;
+      *) msg ERR "telegram: show|set"; exit 1 ;;
+    esac
+    ;;
+
+  discover)
+    sid="${1:?storage-id}"; shift || true
+    mode=true
+    [[ "${1:-}" == "--all" ]] && mode=false
+    rbv_storage_json "$sid" >/dev/null
+    disc_file="$(mktemp)"
+    set +e
+    rbv_discover "$sid" "$mode" >"$disc_file"
+    drc=$?
+    set -e
+    if (( drc != 0 )); then
+      rm -f "$disc_file"
+      exit "$drc"
+    fi
+    printf '%-6s %-50s %s\n' "KIND" "INSTANCE" "KEY"
+    while IFS='|' read -r kind inst key parent; do
+      [[ -n "${key:-}" ]] || continue
+      printf '%-6s %-50s %s\n' "$kind" "$inst" "$key"
+    done <"$disc_file"
+    rm -f "$disc_file"
+    ;;
+
+  run)
+    DUE=false; ONLY=""; WAIT_LOCK=0
+    # Политика всегда: только latest в cache (ручной и auto/tick одинаково).
+    # Аварийный обход: --keep-cache-all или RBV_KEEP_CACHE_ALL=1.
+    CACHE_LATEST=true
+    case "${RBV_KEEP_CACHE_ALL:-}" in 1|true|TRUE|yes|on) CACHE_LATEST=false ;; esac
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --due) DUE=true; shift ;;
+        --storage) ONLY="$2"; shift 2 ;;
+        --cache-latest) CACHE_LATEST=true; shift ;;
+        --keep-cache-all) CACHE_LATEST=false; shift ;;
+        --wait) WAIT_LOCK="${2:-600}"; shift 2 ;;
+        *) msg ERR "unknown $1"; exit 1 ;;
+      esac
+    done
+
+    # Один прогон на хост. Без этого systemd-тик (раз в минуту) стартовал
+    # второй `run --due` поверх идущего, а `run` начинается и заканчивается
+    # docker reclaim → живой restore ловил SIGKILL (exit=137, oom=false).
+    RBV_LOCK_TAG="run${ONLY:+ --storage $ONLY}"
+    export RBV_LOCK_TAG
+    if ! rbv_global_lock "$WAIT_LOCK"; then
+      if [[ "$DUE" == true ]]; then
+        msg INFO "Уже идёт прогон ($(rbv_global_lock_owner)) — расписание пропускаем"
+        exit 0
+      fi
+      msg ERR "Уже идёт прогон/уборка: $(rbv_global_lock_owner)"
+      msg INFO "Дождитесь окончания или запустите с --wait <сек>"
+      exit 1
+    fi
+
+    # Файловый лог сессии (дублирует msg); дети наследуют RBV_LOG.
+    WD="$(rbv_work_dir)"
+    mkdir -p "${WD}/logs"
+    RBV_LOG="${WD}/logs/run_$(date -u +%Y%m%d_%H%M%S).log"
+    export RBV_LOG
+    : >"$RBV_LOG"
+    reason="manual"
+    [[ "$DUE" == true ]] && reason="schedule"
+
+    msg INFO "=== run start reason=${reason} storage=${ONLY:-ALL} ==="
+    msg INFO "лог: ${RBV_LOG}"
+    msg INFO "work_dir: ${WD}"
+    _keep="$(rbv_cfg '.runs_keep // 2')"
+    [[ "$_keep" =~ ^[0-9]+$ ]] || _keep=2
+    _n="$(rbv_runs_prune "$_keep" || echo 0)"
+    _n="$(echo "$_n" | tr -d '[:space:]')"
+    [[ "$_n" =~ ^[0-9]+$ ]] || _n=0
+    (( _n > 0 )) && msg INFO "очистка runs: удалено ${_n} (keep=${_keep}; архивы → cache, затем prune)"
+    export RBV_CACHE_LATEST="$CACHE_LATEST"
+    _dn="$(rbv_docker_reclaim || echo 0)"
+    _dn="$(echo "$_dn" | tr -d '[:space:]')"
+    [[ "$_dn" =~ ^[0-9]+$ ]] || _dn=0
+    (( _dn > 0 )) && msg INFO "docker reclaim: убрано leftover rbv_* ≈${_dn}"
+    if [[ "$CACHE_LATEST" == true ]]; then
+      _cn="$(rbv_cache_prune_latest "${ONLY}" || echo 0)"
+      _cn="$(echo "$_cn" | tr -d '[:space:]')"
+      [[ "$_cn" =~ ^[0-9]+$ ]] || _cn=0
+      msg INFO "cache: политика latest — старые скачанные удалены (${_cn}); остаётся 1 копия на экземпляр"
+    else
+      msg WARN "cache: keep-all (аварийный режим --keep-cache-all)"
+    fi
+    msg INFO "disk: $(rbv_disk_report "$WD")"
+
+    if [[ "$DUE" == true ]]; then
+      msg INFO "шаг: проверка глобального расписания"
+      rbv_global_due || { msg INFO "Ещё не время (глобальное расписание) — выход"; exit 0; }
+      msg OK "расписание: due"
+      # слот занимаем СРАЗУ: иначе многочасовой (или упавший) прогон остаётся
+      # «due», и таймер пытается стартовать его каждую минуту
+      rbv_mark_global_done
+    fi
+
+    enq=0
+    disc_file="$(mktemp)"
+    if [[ -n "$ONLY" ]]; then
+      rbv_storage_json "$ONLY" >/dev/null
+      msg INFO "шаг 1/3: discover untested latest → ${ONLY}"
+      set +e
+      rbv_discover "$ONLY" true >"$disc_file"
+      drc=$?
+      set -e
+      if (( drc != 0 )); then
+        rm -f "$disc_file"
+        msg ERR "discover failed rc=${drc} — см. ${RBV_LOG}"
+        exit "$drc"
+      fi
+      while IFS='|' read -r kind inst key parent; do
+        [[ -n "${key:-}" ]] || continue
+        rbv_enqueue_instance "$ONLY" "$kind" "$inst" "$key" "$parent" "$reason"
+        enq=$((enq + 1))
+      done <"$disc_file"
+    else
+      msg INFO "шаг 1/3: discover untested latest → все хранилища"
+      mapfile -t ids < <(jq -r '.storages[].id' "$RBV_CONFIG")
+      if [[ ${#ids[@]} -eq 0 ]]; then
+        msg WARN "В конфиге нет storages — нечего запускать"
+        rm -f "$disc_file"
+        exit 0
+      fi
+      for sid in "${ids[@]}"; do
+        msg INFO "— storage ${sid}"
+        : >"$disc_file"
+        set +e
+        rbv_discover "$sid" true >"$disc_file"
+        drc=$?
+        set -e
+        if (( drc != 0 )); then
+          msg ERR "discover ${sid} failed rc=${drc}"
+          rm -f "$disc_file"
+          exit "$drc"
+        fi
+        while IFS='|' read -r kind inst key parent; do
+          [[ -n "${key:-}" ]] || continue
+          rbv_enqueue_instance "$sid" "$kind" "$inst" "$key" "$parent" "$reason"
+          enq=$((enq + 1))
+        done <"$disc_file"
+      done
+    fi
+    rm -f "$disc_file"
+
+    msg INFO "шаг 1/3 итог: в очередь поставлено ${enq}"
+    if (( enq == 0 )); then
+      msg WARN "Нечего выполнять (0 untested latest)."
+      msg INFO "Проверьте: rw-backup-verify discover ${ONLY:-<id>} --all"
+      msg INFO "и реестр tested: ${WD}/tested/"
+      msg INFO "лог: ${RBV_LOG}"
+      exit 0
+    fi
+
+    msg INFO "шаг 2/3: worker (последовательный drain очереди)"
+    "${SCRIPT_DIR}/rbv-worker.sh"
+
+    # финальная уборка: только latest в cache; контейнеры/volumes; runs slim/prune
+    if [[ "${RBV_CACHE_LATEST:-true}" == true ]]; then
+      _cn="$(rbv_cache_prune_latest "${ONLY}" || echo 0)"
+      _cn="$(echo "$_cn" | tr -d '[:space:]')"
+      [[ "$_cn" =~ ^[0-9]+$ ]] || _cn=0
+      msg INFO "cache: после прогона — только latest на экземпляр (удалено старых=${_cn}; как в S3, без шифрования)"
+    fi
+    _dn="$(rbv_docker_reclaim || echo 0)"
+    _dn="$(echo "$_dn" | tr -d '[:space:]')"
+    [[ "$_dn" =~ ^[0-9]+$ ]] || _dn=0
+    msg INFO "docker: контейнеры/volumes после тестов убраны (≈${_dn}; образы сохранены)"
+    _mr="$(rbv_mem_reclaim 2>/dev/null || true)"
+    [[ -n "$_mr" ]] && msg INFO "$_mr"
+    _rn="$(rbv_runs_prune 0 || echo 0)"
+    _rn="$(echo "$_rn" | tr -d '[:space:]')"
+    [[ "$_rn" =~ ^[0-9]+$ ]] || _rn=0
+    (( _rn > 0 )) && msg INFO "runs: удалено ${_rn} (отчёты уже в TG/logs; архивы в cache)"
+    msg OK "шаг 3/3: готово"
+    msg INFO "кэш latest: ${WD}/cache/archives/  ·  лог: ${RBV_LOG}"
+    ;;
+
+  queue)
+    sub="${1:-status}"; shift || true
+    case "$sub" in
+      status)
+        ls -1 "$(rbv_queue_dir)"/*.job 2>/dev/null || echo "(пусто)"
+        ;;
+      clear)
+        rm -f "$(rbv_queue_dir)"/*.job
+        msg OK "Очередь очищена"
+        ;;
+      work)
+        RBV_LOCK_TAG="queue work"
+        export RBV_LOCK_TAG
+        rbv_global_lock 0 || { msg ERR "Уже идёт прогон/уборка: $(rbv_global_lock_owner)"; exit 1; }
+        exec "${SCRIPT_DIR}/rbv-worker.sh"
+        ;;
+      *) msg ERR "queue: status|clear|work"; exit 1 ;;
+    esac
+    ;;
+
+  tested)
+    sub="${1:-list}"; shift || true
+    case "$sub" in
+      list)
+        sid="${1:?storage-id}"
+        f="$(rbv_tested_file "$sid")"
+        if [[ ! -f "$f" ]]; then
+          echo "(пусто — нет $f)"
+        else
+          jq -r 'to_entries[] | "\(.key)\tok=\(.value.ok)\tat=\(.value.tested_at)\trun=\(.value.run_id // "")"' "$f"
+        fi
+        ;;
+      clear)
+        sid="${1:?storage-id}"; shift || true
+        key=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --key) key="$2"; shift 2 ;;
+            --all) key=""; shift ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        f="$(rbv_tested_file "$sid")"
+        if [[ ! -f "$f" ]]; then
+          msg INFO "Нечего чистить: $f"
+          exit 0
+        fi
+        if [[ -n "$key" ]]; then
+          tmp="$(mktemp)"
+          jq --arg k "$key" 'del(.[$k])' "$f" >"$tmp"
+          mv -f "$tmp" "$f"
+          msg OK "Удалён ключ из tested: $key"
+        else
+          rm -f "$f"
+          msg OK "Очищен tested: $f"
+        fi
+        ;;
+      *) msg ERR "tested: list|clear"; exit 1 ;;
+    esac
+    ;;
+
+  runs)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      prune)
+        keep=2
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --keep) keep="$2"; shift 2 ;;
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        RBV_LOCK_TAG="runs prune"
+        export RBV_LOCK_TAG
+        rbv_global_lock 0 \
+          || msg WARN "идёт прогон ($(rbv_global_lock_owner)) — его runs/ не трогаю"
+        WD="$(rbv_work_dir)"
+        before="$(rbv_disk_avail_kb "$WD")"
+        n="$(rbv_runs_prune "$keep")"
+        after="$(rbv_disk_avail_kb "$WD")"
+        msg OK "runs prune: удалено ${n}, keep=${keep}"
+        msg INFO "disk: $(rbv_disk_report "$WD")"
+        if [[ -n "$before" && -n "$after" ]]; then
+          msg INFO "свободно было ${before} KiB → стало ${after} KiB"
+        fi
+        msg INFO "кэш архивов: ${WD}/cache/archives/ (S3 не потребуется при cache hit)"
+        ;;
+      *) msg ERR "runs: prune [--keep N]"; exit 1 ;;
+    esac
+    ;;
+
+  cache)
+    sub="${1:-list}"; shift || true
+    WD="$(rbv_work_dir)"
+    cdir="${WD}/cache/archives"
+    case "$sub" in
+      list)
+        if [[ ! -d "$cdir" ]] || [[ -z "$(find "$cdir" -type f -name '*.tar.gz' 2>/dev/null | head -n1)" ]]; then
+          echo "(пусто — $cdir)"
+        else
+          find "$cdir" -type f -name '*.tar.gz' 2>/dev/null | while IFS= read -r p; do
+            sz="$(wc -c <"$p" | tr -d ' ')"
+            k=""; [[ -f "${p}.key" ]] && k="$(head -n1 "${p}.key")"
+            printf '%s\t%s\t%s\n' "$sz" "${k:-?}" "$p"
+          done
+        fi
+        ;;
+      prune)
+        sid=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --storage) sid="$2"; shift 2 ;;
+            --latest) shift ;; # default
+            *) msg ERR "unknown $1"; exit 1 ;;
+          esac
+        done
+        before="$(rbv_disk_avail_kb "$WD")"
+        n="$(rbv_cache_prune_latest "$sid")"
+        after="$(rbv_disk_avail_kb "$WD")"
+        msg OK "cache prune: удалено старых=${n} (оставлен latest на экземпляр${sid:+, storage=$sid})"
+        msg INFO "disk: $(rbv_disk_report "$WD")"
+        if [[ -n "$before" && -n "$after" ]]; then
+          msg INFO "свободно было ${before} KiB → стало ${after} KiB"
+        fi
+        ;;
+      clear)
+        rm -rf "${cdir:?}"
+        mkdir -p "$cdir"
+        msg OK "Очищен cache: $cdir"
+        ;;
+      *) msg ERR "cache: list|prune|clear"; exit 1 ;;
+    esac
+    ;;
+
+  disk)
+    WD="$(rbv_work_dir)"
+    msg INFO "work_dir: $WD"
+    msg INFO "df work_dir: $(rbv_disk_report "$WD")"
+    df -h /var/lib/docker 2>/dev/null | tail -n1 | while IFS= read -r l; do msg INFO "df docker: $l"; done || true
+    echo
+    echo "=== rw-backup-verify ==="
+    du -sh "$WD" "$WD"/runs "$WD"/cache "$WD"/logs "$WD"/tested 2>/dev/null || true
+    echo
+    echo "=== docker (здесь реально лежит PGDATA verify-контейнеров) ==="
+    docker system df 2>/dev/null || true
+    echo
+    echo "=== leftover rbv_* ==="
+    docker ps -a --filter 'name=rbv_' --format 'table {{.Names}}\t{{.Status}}\t{{.Size}}' 2>/dev/null || true
+    echo
+    echo "=== /var/lib/postgresql на ХОСТЕ (rbv НЕ пишет сюда) ==="
+    if [[ -d /var/lib/postgresql ]]; then
+      du -sh /var/lib/postgresql /var/lib/postgresql/data /var/lib/postgresql/data/pg_wal 2>/dev/null || true
+      msg WARN "каталог есть на хосте — это НЕ sandbox rbv_pg (у него нет -v). Ищите host postgres / чужой compose bind."
+    else
+      echo "(нет /var/lib/postgresql на хосте — норма)"
+    fi
+    echo
+    msg INFO "освободить: rw-backup-verify reclaim [--docker]"
+    ;;
+
+  reclaim)
+    DOCKER_FULL=false
+    FORCE=false
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --docker) DOCKER_FULL=true; shift ;;
+        --force) FORCE=true; shift ;;
+        *) msg ERR "unknown $1 (reclaim [--docker] [--force])"; exit 1 ;;
+      esac
+    done
+    # reclaim сносит контейнеры/volumes — во время прогона это ломает restore
+    RBV_LOCK_TAG="reclaim"
+    export RBV_LOCK_TAG
+    if ! rbv_global_lock 0; then
+      msg ERR "Идёт прогон: $(rbv_global_lock_owner) — уборка сейчас убьёт его песочницу"
+      if [[ "$FORCE" != true ]]; then
+        msg INFO "Дождитесь окончания или: rw-backup-verify reclaim --force (артефакты живого прогона всё равно не тронем)"
+        exit 1
+      fi
+      msg WARN "--force: чищу только то, что не принадлежит живому прогону"
+    fi
+    WD="$(rbv_work_dir)"
+    before="$(rbv_disk_avail_kb "$WD")"
+    msg INFO "disk до: $(rbv_disk_report "$WD")"
+    n="$(rbv_runs_prune 0 || echo 0)"
+    msg INFO "runs prune keep=0: удалено ${n}"
+    export RBV_CACHE_LATEST=true
+    cn="$(rbv_cache_prune_latest "" || echo 0)"
+    msg INFO "cache prune latest: удалено ${cn} (архивы как в S3, без доп. шифрования)"
+    dn="$(rbv_docker_reclaim || echo 0)"
+    msg INFO "docker reclaim: контейнеры/volumes ≈${dn} (образы НЕ удаляем)"
+    if [[ "$DOCKER_FULL" == true ]]; then
+      if [[ -n "$(rbv_active_entries)" ]]; then
+        msg WARN "идёт прогон — общий prune пропускаю (снёс бы его контейнеры/сети)"
+      else
+        msg INFO "docker volume prune + container prune (образы сохраняем)…"
+        docker volume prune -f 2>&1 | tail -n 3 || true
+        docker container prune -f 2>&1 | tail -n 3 || true
+        docker network prune -f >/dev/null 2>&1 || true
+      fi
+    fi
+    _mr="$(rbv_mem_reclaim 2>/dev/null || true)"
+    [[ -n "$_mr" ]] && msg INFO "$_mr"
+    after="$(rbv_disk_avail_kb "$WD")"
+    msg OK "disk после: $(rbv_disk_report "$WD")"
+    if [[ -n "$before" && -n "$after" ]]; then
+      msg INFO "свободно было ${before} KiB → стало ${after} KiB"
+    fi
+    if command -v free >/dev/null 2>&1; then
+      msg INFO "RAM: $(free -h | awk '/Mem:/{printf "avail=%s total=%s", $7, $2}')"
+    fi
+    if [[ -d /var/lib/postgresql ]]; then
+      msg WARN "на хосте есть /var/lib/postgresql — rbv его не создаёт. Проверьте: dpkg -l postgresql*; docker ps -a; findmnt /var/lib/postgresql"
+    fi
+    ;;
+
+  tick)
+    # Таймер тикает раз в минуту. Если прогон уже идёт — молча выходим:
+    # `run --due` сам возьмёт глобальный лок, но лишний старт службы только
+    # засоряет journal.
+    if [[ -n "$(rbv_active_entries)" ]]; then
+      exit 0
+    fi
+    if rbv_global_due; then
+      exec "${SCRIPT_DIR}/rw-backup-verify" run --due
+    fi
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac
