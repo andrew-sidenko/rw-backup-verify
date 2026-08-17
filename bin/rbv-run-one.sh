@@ -863,6 +863,7 @@ if [[ "$ok" == true && -n "${PROJ_DIR:-}" ]] && rbv_check_enabled "$KIND" stack;
               del(.ports, .container_name, .env_file, .network_mode, .links, .deploy)
               | .networks = {"rbv": {}}
               | .restart = "no"
+              | del(.depends_on)
               | if .environment then .environment |= fix_env else . end
               | if .volumes then
                   .volumes |= map(select(
